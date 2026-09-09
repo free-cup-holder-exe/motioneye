@@ -109,6 +109,9 @@ def _list_media_files(
     exts: List[str],
     sub_path: Optional[str] = None,
     with_stat: bool = True,
+    *,
+    min_timestamp: Optional[float] = None,
+    max_timestamp: Optional[float] = None,
 ) -> List[tuple]:
     # Determine scan path based on sub_path parameter
     if sub_path is not None:
@@ -120,6 +123,9 @@ def _list_media_files(
             return []
     else:
         scan_path = base_path
+
+    # loop-invariant: only compute the window flag once
+    windowed: bool = min_timestamp is not None or max_timestamp is not None
 
     media_files = []
     for entry in os.scandir(scan_path):
@@ -135,7 +141,7 @@ def _list_media_files(
 
             # If stat is not needed, use None as placeholder
             st = None
-            if with_stat:
+            if with_stat or windowed:
                 # stat call may fail due to race conditions or permission issues
                 try:
                     st = entry.stat(follow_symlinks=False)
@@ -143,11 +149,29 @@ def _list_media_files(
                     logging.error(f'stat failed: {e}')
                     continue
 
-            media_files.append((entry.path, st))
+                # Skip files outside the caller's window before any of the
+                # expensive per-file work in _do_list_media. Bounds are
+                # inclusive, i.e. wider than any caller's own filter.
+                if windowed:
+                    mtime: float = st.st_mtime
+                    if min_timestamp is not None and mtime < min_timestamp:
+                        continue
+                    if max_timestamp is not None and mtime > max_timestamp:
+                        continue
+
+            media_files.append((entry.path, st if with_stat else None))
 
         # recurse into subdirectories only when no sub_path filter is set
         elif sub_path is None and entry.is_dir(follow_symlinks=False):
-            media_files.extend(_list_media_files(entry.path, exts, with_stat=with_stat))
+            media_files.extend(
+                _list_media_files(
+                    entry.path,
+                    exts,
+                    with_stat=with_stat,
+                    min_timestamp=min_timestamp,
+                    max_timestamp=max_timestamp,
+                )
+            )
 
     return media_files
 
@@ -206,10 +230,25 @@ def _remove_older_files(
         uploadservices.clean_cloud(directory, {}, clean_cloud_info)
 
 
-def _do_list_media(pipe, target_dir, exts, sub_path, with_stat):
+def _do_list_media(
+    pipe,
+    target_dir: str,
+    exts: List[str],
+    sub_path: Optional[str] = None,
+    with_stat: bool = True,
+    min_timestamp: Optional[float] = None,
+    max_timestamp: Optional[float] = None,
+) -> None:
     from mimetypes import guess_type
 
-    mf = _list_media_files(target_dir, exts, sub_path, with_stat)
+    mf = _list_media_files(
+        target_dir,
+        exts,
+        sub_path,
+        with_stat,
+        min_timestamp=min_timestamp,
+        max_timestamp=max_timestamp,
+    )
     for p, st in mf:
         path = p[len(target_dir) :]
         if not path.startswith('/'):
@@ -534,6 +573,9 @@ def list_media(
     media_type: str,
     prefix: Optional[str] = None,
     with_stat: bool = True,
+    *,
+    min_timestamp: Optional[float] = None,
+    max_timestamp: Optional[float] = None,
 ) -> Awaitable:
     target_dir = camera_config.get('target_dir')
     utils.validate_paths(prefix, target_dir=target_dir)
@@ -548,7 +590,16 @@ def list_media(
 
     parent_pipe, child_pipe = multiprocessing.Pipe(duplex=False)
     process = multiprocessing.Process(
-        target=_do_list_media, args=(child_pipe, target_dir, exts, prefix, with_stat)
+        target=_do_list_media,
+        args=(
+            child_pipe,
+            target_dir,
+            exts,
+            prefix,
+            with_stat,
+            min_timestamp,
+            max_timestamp,
+        ),
     )
     process.start()
     child_pipe.close()
