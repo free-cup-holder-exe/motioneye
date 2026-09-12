@@ -20,6 +20,7 @@ import argparse
 import gettext
 import locale
 import logging
+import multiprocessing
 import os.path
 import sys
 from shlex import quote
@@ -314,6 +315,29 @@ def print_version_and_exit():
     sys.exit()
 
 
+def configure_multiprocessing():
+    """Keep the 'fork' start method for our multiprocessing children.
+
+    Python 3.14 changed the default start method on POSIX platforms
+    other than macOS from 'fork' to 'forkserver' (python/cpython#84559).
+    A 'forkserver' child does not inherit the parent's runtime state,
+    but ours rely on it: the settings loaded from the config file and
+    the logging configuration. Without 'fork' the cleanup child looks
+    for cameras in the built-in default conf path, finds none and
+    deletes nothing (#3411); the zip child writes its archive under the
+    built-in default media path and the task pool reads the upload
+    state from the built-in default conf path.
+    """
+    if 'fork' not in multiprocessing.get_all_start_methods():
+        return
+
+    # force=True: don't fail if something already resolved the default
+    # context (any get_context() call or multiprocessing object pins it).
+    # Objects created before this call keep that context, so it must run
+    # before any multiprocessing object exists.
+    multiprocessing.set_start_method('fork', force=True)
+
+
 def main():
     for a in sys.argv:
         if a == '-v':
@@ -322,6 +346,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] == '-h':
         print_usage_and_exit(0)
 
+    configure_multiprocessing()
     load_settings()
 
     command = sys.argv[1]
