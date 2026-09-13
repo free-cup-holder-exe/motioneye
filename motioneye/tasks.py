@@ -16,11 +16,12 @@
 
 import calendar
 import datetime
+import functools
 import logging
-import multiprocessing
 import os
 import pickle
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 from tornado.ioloop import IOLoop
@@ -31,35 +32,30 @@ _INTERVAL = 2
 _STATE_FILE_NAME = 'tasks.pickle'
 _MAX_TASKS = 100
 
-# we must be sure there's only one extra process that handles all tasks
-# TODO replace the pool with one simple thread
+# we must be sure there's only one extra thread that handles all tasks
 _POOL_SIZE = 1
 
 _tasks: List[tuple] = []
-_pool = None
-
-
-def _init_pool_process():
-    import signal
-
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+_executor = None
 
 
 def start():
-    global _pool
+    global _executor
 
     io_loop = IOLoop.current()
     io_loop.add_timeout(datetime.timedelta(seconds=_INTERVAL), _check_tasks)
 
     _load()
-    _pool = multiprocessing.Pool(_POOL_SIZE, initializer=_init_pool_process)
+    _executor = ThreadPoolExecutor(max_workers=_POOL_SIZE, thread_name_prefix='task')
 
 
 def stop():
-    global _pool
+    global _executor
 
-    _pool = None
+    if _executor is not None:
+        _executor.shutdown(wait=False)
+
+    _executor = None
 
 
 def add(when, func, tag=None, callback=None, **params):
@@ -100,15 +96,27 @@ def _check_tasks():
     while _tasks and _tasks[0][0] <= now:
         when, func, tag, callback, params = _tasks.pop(0)  # @UnusedVariable
 
-        logging.debug(f'executing task "{tag or func.__name__}"')
-        _pool.apply_async(
-            func, kwds=params, callback=callback if callable(callback) else None
-        )
+        name = tag or func.__name__
+        logging.debug(f'executing task "{name}"')
+        future = _executor.submit(func, **params)
+        future.add_done_callback(functools.partial(_task_done, name, callback))
 
         changed = True
 
     if changed:
         _save()
+
+
+def _task_done(name, callback, future):
+    try:
+        result = future.result()
+
+    except Exception as e:
+        logging.error(f'task "{name}" failed: {str(e)}', exc_info=True)
+        return
+
+    if callable(callback):
+        callback(result)
 
 
 def _load():

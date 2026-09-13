@@ -16,15 +16,13 @@
 
 import datetime
 import logging
-import multiprocessing
-import os
-import signal
+import threading
 
 from tornado.ioloop import IOLoop
 
 from motioneye import mediafiles, settings
 
-_process = None
+_thread = None
 
 
 def start():
@@ -39,28 +37,27 @@ def start():
 
 
 def stop():
-    global _process
+    global _thread
 
     if not running():
-        _process = None
+        _thread = None
         return
 
-    if _process.is_alive():
-        _process.join(timeout=10)
+    _thread.join(timeout=10)
 
-    if _process.is_alive():
-        logging.error('cleanup process did not finish in time, killing it...')
-        os.kill(_process.pid, signal.SIGKILL)
+    if _thread.is_alive():
+        # a daemon thread, it dies with the process
+        logging.error('cleanup did not finish in time, abandoning it...')
 
-    _process = None
+    _thread = None
 
 
 def running():
-    return _process is not None and _process.is_alive()
+    return _thread is not None and _thread.is_alive()
 
 
 def _run_process():
-    global _process
+    global _thread
 
     io_loop = IOLoop.current()
 
@@ -69,19 +66,15 @@ def _run_process():
         datetime.timedelta(seconds=settings.CLEANUP_INTERVAL), _run_process
     )
 
-    if not running():  # check that the previous process has finished
+    if not running():  # check that the previous run has finished
         logging.debug('running cleanup process...')
 
-        _process = multiprocessing.Process(target=_do_cleanup)
-        _process.start()
+        _thread = threading.Thread(target=_do_cleanup, name='cleanup', daemon=True)
+        _thread.start()
 
 
 def _do_cleanup():
-    # this will be executed in a separate subprocess
-
-    # ignore the terminate and interrupt signals in this subprocess
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    # this will be executed in a separate thread
 
     try:
         mediafiles.cleanup_media('picture')
